@@ -2,7 +2,8 @@ const { chromium } = require('playwright');
 const fs = require('fs-extra');
 const path = require('path');
 const axios = require('axios');
-const { uploadToNotion } = require('./notion_uploader');
+const { uploadToNotion } = require('./notion_uploader'); // Use Notion uploader, not Airtable
+const { uploadToCloudinary } = require('./cloudinary_helper');
 
 async function downloadFile(url, dest) {
     if (!url) return;
@@ -29,7 +30,7 @@ async function scrapeAndSave(platform, query) {
     await fs.ensureDir(downloadRootDir);
 
     console.log(`Starting ${platform} scrape for "${query}"...`);
-    const browser = await chromium.launch({ headless: false }); // Visible for CAPTCHA handling
+    const browser = await chromium.launch({ headless: false });
     const context = await browser.newContext({
         viewport: { width: 1280, height: 800 },
         userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -43,22 +44,16 @@ async function scrapeAndSave(platform, query) {
             const url = `https://www.douyin.com/search/${encodeURIComponent(query)}`;
             await page.goto(url);
 
-            // Wait for results to load - Douyin is heavy on JS
-            // Trying to find video cards. The selectors might change, generic approach is safer.
-            // Look for elements that look like video containers
             try {
                 await page.waitForSelector('[data-e2e="search-card-video-item"]', { timeout: 15000 });
             } catch (e) {
                 console.log('Timeout waiting for specific Douyin selector, checking for generic list...');
             }
 
-            // Scroll down a bit to trigger lazy loading
             await page.evaluate(() => window.scrollBy(0, 500));
             await page.waitForTimeout(2000);
 
             const videoElements = await page.$$('[data-e2e="search-card-video-item"]');
-
-            // Limit to first 3 results to be polite and fast
             const limit = Math.min(videoElements.length, 3);
 
             for (let i = 0; i < limit; i++) {
@@ -71,37 +66,52 @@ async function scrapeAndSave(platform, query) {
                     link = 'https://www.douyin.com' + link;
                 }
 
-                // Extracting thumbnail often requires digging into style or img src
                 const imgEl = await el.querySelector('img');
                 const src = imgEl ? await imgEl.getAttribute('src') : '';
+
+                // Try for video src
+                const videoEl = await el.querySelector('video');
+                const videoSrc = videoEl ? await videoEl.getAttribute('src') : null;
+
+                // Download locally first
+                let thumbPath = '';
+                let videoPath = '';
+                let thumbCloudUrl = '';
+                let videoCloudUrl = '';
+
+                if (src) {
+                    thumbPath = path.join(downloadRootDir, `douyin_${i}_thumb.jpg`);
+                    await downloadFile(src, thumbPath);
+                    // Upload to Cloudinary
+                    thumbCloudUrl = await uploadToCloudinary(thumbPath, 'douyin_thumbs');
+                }
+
+                if (videoSrc && videoSrc.startsWith('http')) {
+                    videoPath = path.join(downloadRootDir, `douyin_${i}_video.mp4`);
+                    await downloadFile(videoSrc, videoPath);
+                    // Upload to Cloudinary
+                    videoCloudUrl = await uploadToCloudinary(videoPath, 'douyin_videos');
+                }
 
                 results.push({
                     id: `douyin_${Date.now()}_${i}`,
                     title: text.split('\n')[0] || query,
-                    videoUrl: link, // Douyin direct video links are hard to get without network interception, saving page link for now
-                    thumbUrl: src,
+                    videoUrl: videoCloudUrl || link, // Use Cloudinary URL if available
+                    thumbUrl: thumbCloudUrl || src, // Use Cloudinary URL if available
                     clipUrl: link
                 });
-
-                // Download thumb
-                if (src) {
-                    await downloadFile(src, path.join(downloadRootDir, `douyin_${i}_thumb.jpg`));
-                }
             }
 
         } else if (platform === 'taobao') {
             const url = `https://s.taobao.com/search?q=${encodeURIComponent(query)}`;
             await page.goto(url);
 
-            // Taobao often pushes login. 
-            // We wait for a specific item container.
             try {
-                await page.waitForSelector('.Content--content--15Fr8o1', { timeout: 15000 }); // Varies often
+                await page.waitForSelector('.Content--content--15Fr8o1', { timeout: 15000 });
             } catch (e) {
-                console.log('Timeout waiting for Taobao selector (login might be required).');
+                console.log('Timeout waiting for Taobao selector.');
             }
 
-            // Fallback to searching for any link with item id
             const items = await page.$$('a[href*="item.htm"]');
             const limit = Math.min(items.length, 3);
 
@@ -112,19 +122,23 @@ async function scrapeAndSave(platform, query) {
                 const imgEl = await el.querySelector('img');
                 const src = imgEl ? await imgEl.getAttribute('src') : '';
 
+                let thumbPath = '';
+                let thumbCloudUrl = '';
+                let properSrc = src.startsWith('http') ? src : 'https:' + src;
+
+                if (src) {
+                    thumbPath = path.join(downloadRootDir, `taobao_${i}_thumb.jpg`);
+                    await downloadFile(properSrc, thumbPath);
+                    thumbCloudUrl = await uploadToCloudinary(thumbPath, 'taobao_thumbs');
+                }
+
                 results.push({
                     id: `taobao_${Date.now()}_${i}`,
                     title: title || query,
-                    videoUrl: link.startsWith('http') ? link : 'https:' + link, // Taobao items might not be videos, treating as "clip"
-                    thumbUrl: src.startsWith('http') ? src : 'https:' + src,
+                    videoUrl: link.startsWith('http') ? link : 'https:' + link,
+                    thumbUrl: thumbCloudUrl || properSrc,
                     clipUrl: link.startsWith('http') ? link : 'https:' + link
                 });
-
-                // Download thumb
-                if (src) {
-                    const validSrc = src.startsWith('http') ? src : 'https:' + src;
-                    await downloadFile(validSrc, path.join(downloadRootDir, `taobao_${i}_thumb.jpg`));
-                }
             }
         }
     } catch (error) {
@@ -133,11 +147,10 @@ async function scrapeAndSave(platform, query) {
         await browser.close();
     }
 
-    // Save to Notion
+    // Save to Notion (using Cloudinary URLs)
     if (results.length > 0) {
         console.log(`Found ${results.length} items. Uploading to Notion...`);
-        // Map to expected notion uploader format
-        // existing uploader expects { id, title, videoUrl, thumbUrl, clipUrl }
+        console.log(`Local files saved to: ${downloadRootDir}`);
         await uploadToNotion(results);
         return results;
     } else {

@@ -14,44 +14,79 @@ async function uploadToNotion(results) {
 
     console.log(`Uploading ${results.length} items to Notion...`);
 
-    properties: {
-        '이름': {
-            title: [
-                {
-                    text: {
-                        content: item.title || item.id
+    for (const item of results) {
+        try {
+            // Prepare children blocks for the page content
+            const children = [];
+
+            // Add Video block if we have a valid video URL (Cloudinary or otherwise)
+            if (item.videoUrl && item.videoUrl.startsWith('http')) {
+                children.push({
+                    object: 'block',
+                    type: 'video',
+                    video: {
+                        type: 'external',
+                        external: {
+                            url: item.videoUrl
+                        }
                     }
-                }
-            ]
-        },
-        'keyword': {
-            rich_text: [
-                {
-                    text: {
-                        content: item.clipUrl || item.videoUrl || ''
+                });
+            } else if (item.thumbUrl && item.thumbUrl.startsWith('http')) {
+                // Fallback to image if no video
+                children.push({
+                    object: 'block',
+                    type: 'image',
+                    image: {
+                        type: 'external',
+                        external: {
+                            url: item.thumbUrl
+                        }
                     }
-                }
-            ]
-        },
-        'media': {
-            files: [
-                {
-                    name: `${item.id}.jpg`,
-                    type: 'external',
-                    external: {
-                        url: item.thumbUrl
+                });
+            }
+
+            // Create the page
+            await notion.pages.create({
+                parent: { database_id: databaseId },
+                properties: {
+                    '이름': {
+                        title: [
+                            {
+                                text: {
+                                    content: item.title || item.id
+                                }
+                            }
+                        ]
+                    },
+                    'keyword': {
+                        rich_text: [
+                            {
+                                text: {
+                                    content: item.videoUrl || item.clipUrl || ''
+                                }
+                            }
+                        ]
+                    },
+                    'media': {
+                        files: [
+                            {
+                                name: `${item.id}_thumb.jpg`,
+                                type: 'external',
+                                external: {
+                                    url: item.thumbUrl || 'https://via.placeholder.com/150'
+                                }
+                            }
+                        ]
                     }
-                }
-            ]
+                },
+                children: children
+            });
+            console.log(`Successfully uploaded: ${item.title}`);
+        } catch (error) {
+            console.error(`Failed to upload ${item.id} to Notion:`, error.message);
         }
     }
-});
-console.log(`Successfully uploaded: ${item.title}`);
-        } catch (error) {
-    console.error(`Failed to upload ${item.id} to Notion:`, error.message);
-}
-    }
-console.log('Notion upload complete.');
+    console.log('Notion upload complete.');
 }
 
 if (require.main === module) {
