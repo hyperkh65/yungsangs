@@ -1,36 +1,43 @@
 const { chromium } = require('playwright');
-const fs = require('fs-extra');
-const path = require('path');
 const axios = require('axios');
-const { uploadToNotion } = require('./notion_uploader'); // Use Notion uploader, not Airtable
+const { uploadToNotion } = require('./notion_uploader');
 const { uploadToCloudinary } = require('./cloudinary_helper');
 
-async function downloadFile(url, dest) {
-    if (!url) return;
+async function fetchFileBuffer(url) {
+    if (!url) return null;
     try {
         const response = await axios({
             url,
             method: 'GET',
-            responseType: 'stream',
+            responseType: 'arraybuffer', // Important for binary data
             headers: { 'User-Agent': 'Mozilla/5.0' }
         });
-        return new Promise((resolve, reject) => {
-            const writer = fs.createWriteStream(dest);
-            response.data.pipe(writer);
-            writer.on('finish', resolve);
-            writer.on('error', reject);
-        });
+        return response.data;
     } catch (e) {
         console.error(`Error downloading ${url}:`, e.message);
+        return null;
     }
 }
 
 async function scrapeAndSave(platform, query) {
-    const downloadRootDir = path.join(__dirname, '..', 'downloads', `${platform}_${query}`);
-    await fs.ensureDir(downloadRootDir);
-
     console.log(`Starting ${platform} scrape for "${query}"...`);
-    const browser = await chromium.launch({ headless: false });
+
+    let browser;
+    try {
+        // Vercel / Remote Browser Logic
+        if (process.env.BROWSER_WS_ENDPOINT) {
+            console.log('Connecting to remote browser...');
+            browser = await chromium.connect(process.env.BROWSER_WS_ENDPOINT);
+        } else {
+            // Local Development Logic
+            console.log('Launching local browser...');
+            browser = await chromium.launch({ headless: true }); // Vercel can't do headed anyway
+        }
+    } catch (e) {
+        console.error('Failed to launch browser. If on Vercel, make sure BROWSER_WS_ENDPOINT is set.', e);
+        return { error: 'Browser launch failed' };
+    }
+
     const context = await browser.newContext({
         viewport: { width: 1280, height: 800 },
         userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -47,9 +54,10 @@ async function scrapeAndSave(platform, query) {
             try {
                 await page.waitForSelector('[data-e2e="search-card-video-item"]', { timeout: 15000 });
             } catch (e) {
-                console.log('Timeout waiting for specific Douyin selector, checking for generic list...');
+                console.log('Timeout waiting for Douyin selector');
             }
 
+            // Scroll for lazy load
             await page.evaluate(() => window.scrollBy(0, 500));
             await page.waitForTimeout(2000);
 
@@ -73,31 +81,29 @@ async function scrapeAndSave(platform, query) {
                 const videoEl = await el.querySelector('video');
                 const videoSrc = videoEl ? await videoEl.getAttribute('src') : null;
 
-                // Download locally first
-                let thumbPath = '';
-                let videoPath = '';
+                // Process in memory
                 let thumbCloudUrl = '';
                 let videoCloudUrl = '';
 
                 if (src) {
-                    thumbPath = path.join(downloadRootDir, `douyin_${i}_thumb.jpg`);
-                    await downloadFile(src, thumbPath);
-                    // Upload to Cloudinary
-                    thumbCloudUrl = await uploadToCloudinary(thumbPath, 'douyin_thumbs');
+                    const buffer = await fetchFileBuffer(src);
+                    if (buffer) {
+                        thumbCloudUrl = await uploadToCloudinary(buffer, 'douyin_thumbs');
+                    }
                 }
 
                 if (videoSrc && videoSrc.startsWith('http')) {
-                    videoPath = path.join(downloadRootDir, `douyin_${i}_video.mp4`);
-                    await downloadFile(videoSrc, videoPath);
-                    // Upload to Cloudinary
-                    videoCloudUrl = await uploadToCloudinary(videoPath, 'douyin_videos');
+                    const buffer = await fetchFileBuffer(videoSrc);
+                    if (buffer) {
+                        videoCloudUrl = await uploadToCloudinary(buffer, 'douyin_videos');
+                    }
                 }
 
                 results.push({
                     id: `douyin_${Date.now()}_${i}`,
                     title: text.split('\n')[0] || query,
-                    videoUrl: videoCloudUrl || link, // Use Cloudinary URL if available
-                    thumbUrl: thumbCloudUrl || src, // Use Cloudinary URL if available
+                    videoUrl: videoCloudUrl || link,
+                    thumbUrl: thumbCloudUrl || src,
                     clipUrl: link
                 });
             }
@@ -122,14 +128,14 @@ async function scrapeAndSave(platform, query) {
                 const imgEl = await el.querySelector('img');
                 const src = imgEl ? await imgEl.getAttribute('src') : '';
 
-                let thumbPath = '';
                 let thumbCloudUrl = '';
-                let properSrc = src.startsWith('http') ? src : 'https:' + src;
+                const properSrc = src.startsWith('http') ? src : 'https:' + src;
 
                 if (src) {
-                    thumbPath = path.join(downloadRootDir, `taobao_${i}_thumb.jpg`);
-                    await downloadFile(properSrc, thumbPath);
-                    thumbCloudUrl = await uploadToCloudinary(thumbPath, 'taobao_thumbs');
+                    const buffer = await fetchFileBuffer(properSrc);
+                    if (buffer) {
+                        thumbCloudUrl = await uploadToCloudinary(buffer, 'taobao_thumbs');
+                    }
                 }
 
                 results.push({
@@ -144,31 +150,19 @@ async function scrapeAndSave(platform, query) {
     } catch (error) {
         console.error('Scraping error:', error);
     } finally {
-        await browser.close();
+        if (browser) await browser.close();
     }
 
-    // Save to Notion (using Cloudinary URLs)
+    // Save to Notion
     if (results.length > 0) {
         console.log(`Found ${results.length} items. Uploading to Notion...`);
-        console.log(`Local files saved to: ${downloadRootDir}`);
         await uploadToNotion(results);
-        return results;
+        return { success: true, count: results.length };
     } else {
         console.log('No results found.');
-        return [];
+        return { success: false, count: 0 };
     }
 }
 
-// Allow running directly
-if (require.main === module) {
-    const platform = process.argv[2];
-    const query = process.argv[3];
-
-    if (!platform || !query) {
-        console.log('Usage: node douyin_taobao_scraper.js <douyin|taobao> <search_term>');
-    } else {
-        scrapeAndSave(platform, query);
-    }
-}
-
+// Ensure function is exported
 module.exports = { scrapeAndSave };

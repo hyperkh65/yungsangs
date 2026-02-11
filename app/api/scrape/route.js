@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
-import { exec } from 'child_process';
-import path from 'path';
+// Directly import the function. This ensures it's bundled by Vercel.
+import { scrapeAndSave } from '../../../scraper/douyin_taobao_scraper';
 
 export async function POST(req) {
     try {
@@ -14,28 +14,24 @@ export async function POST(req) {
             return NextResponse.json({ error: 'Invalid platform' }, { status: 400 });
         }
 
-        // Execute the scraper script
-        const scraperPath = path.resolve(process.cwd(), '../scraper/douyin_taobao_scraper.js');
+        console.log(`Starting in-process scrape for ${platform}: ${query}`);
 
-        // Wrap exec in a promise
-        const runScraper = () => new Promise((resolve, reject) => {
-            exec(`node "${scraperPath}" ${platform} "${query}"`, (error, stdout, stderr) => {
-                if (error) {
-                    console.error(`exec error: ${error}`);
-                    reject(error);
-                }
-                console.log(`stdout: ${stdout}`);
-                console.error(`stderr: ${stderr}`);
-                resolve(stdout);
-            });
+        // Call function directly (await result)
+        // Note: On Vercel, this might timeout if it takes > 10s (Hobby plan) or 60s (Pro).
+        // Scrapers often take longer. Background jobs are better but for simple setup:
+        const result = await scrapeAndSave(platform, query);
+
+        return NextResponse.json({
+            success: true,
+            message: `Scraped results for "${query}" on ${platform}`,
+            data: result
         });
-
-        await runScraper();
-
-        return NextResponse.json({ success: true, message: `Scraped and saved results for "${query}" on ${platform}` });
 
     } catch (error) {
         console.error('API Error:', error);
-        return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
+        return NextResponse.json({
+            error: 'Internal Server Error',
+            details: error.message
+        }, { status: 500 });
     }
 }
